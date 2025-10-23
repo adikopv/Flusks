@@ -1,6 +1,0 @@
-flask
-requests
-BeautifulSoup
-re
-json
-jsonify
