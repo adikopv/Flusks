@@ -1,5 +1,0 @@
-Flask==3.0.3
-playwright==1.47.0
-requests==2.32.3
-urllib3==2.2.3
-fake-useragent==1.5.1
